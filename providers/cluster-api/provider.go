@@ -27,7 +27,7 @@ import (
 	"slices"
 	"sync"
 
-	capiv1beta1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	utilkubeconfig "sigs.k8s.io/cluster-api/util/kubeconfig"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -53,23 +53,34 @@ type Options struct {
 	// ClusterOptions are the options passed to the cluster constructor.
 	ClusterOptions []cluster.Option
 
+	// ObjectToWatch is the Cluster API Cluster type the provider watches.
+	// If nil, it defaults to capiv1beta2.Cluster.
+	//
+	// Users may set this to an older CAPI Cluster type (e.g. v1beta1.Cluster)
+	// for backwards compatibility with prior Cluster-API API versions.
+	ObjectToWatch client.Object
+
 	// GetSecret is a function that returns the raw kubeconfig bytes for a CAPI cluster.
 	// Defaults to reading the CAPI-managed kubeconfig secret.
-	GetSecret func(ctx context.Context, cl client.Client, ccl *capiv1beta1.Cluster) ([]byte, error)
+	GetSecret func(ctx context.Context, cl client.Client, ccl client.Object) ([]byte, error)
 
 	// NewCluster is a function that creates a new cluster from a rest.Config.
 	// The cluster will be started by the provider.
-	NewCluster func(ctx context.Context, ccl *capiv1beta1.Cluster, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error)
+	NewCluster func(ctx context.Context, ccl client.Object, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error)
 
 	// IsReady is a function that determines if a CAPI cluster is ready to be engaged.
-	// If not provided, defaults to checking that the cluster phase is Provisioned.
-	IsReady func(ctx context.Context, ccl *capiv1beta1.Cluster) bool
+	// If not provided, defaults to checking that the Cluster's control plane has
+	// been initialized.
+	IsReady func(ctx context.Context, ccl client.Object) bool
 }
 
 func setDefaults(opts *Options) {
+	if opts.ObjectToWatch == nil {
+		opts.ObjectToWatch = &capiv1beta2.Cluster{}
+	}
 	if opts.GetSecret == nil {
-		opts.GetSecret = func(ctx context.Context, cl client.Client, ccl *capiv1beta1.Cluster) ([]byte, error) {
-			bs, err := utilkubeconfig.FromSecret(ctx, cl, types.NamespacedName{Name: ccl.Name, Namespace: ccl.Namespace})
+		opts.GetSecret = func(ctx context.Context, cl client.Client, ccl client.Object) ([]byte, error) {
+			bs, err := utilkubeconfig.FromSecret(ctx, cl, types.NamespacedName{Name: ccl.GetName(), Namespace: ccl.GetNamespace()})
 			if err != nil {
 				return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
 			}
@@ -77,13 +88,18 @@ func setDefaults(opts *Options) {
 		}
 	}
 	if opts.NewCluster == nil {
-		opts.NewCluster = func(ctx context.Context, ccl *capiv1beta1.Cluster, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error) {
+		opts.NewCluster = func(ctx context.Context, ccl client.Object, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error) {
 			return cluster.New(cfg, opts...)
 		}
 	}
 	if opts.IsReady == nil {
-		opts.IsReady = func(_ context.Context, ccl *capiv1beta1.Cluster) bool {
-			return ccl.Status.GetTypedPhase() == capiv1beta1.ClusterPhaseProvisioned
+		opts.IsReady = func(_ context.Context, ccl client.Object) bool {
+			cluster, ok := ccl.(*capiv1beta2.Cluster)
+			if !ok {
+				return false
+			}
+			return cluster.Status.Initialization.ControlPlaneInitialized != nil &&
+				*cluster.Status.Initialization.ControlPlaneInitialized
 		}
 	}
 }
@@ -136,7 +152,7 @@ func (p *Provider) SetupWithManager(mgr mcmanager.Manager) error {
 	p.client = localMgr.GetClient()
 
 	if err := builder.ControllerManagedBy(localMgr).
-		For(&capiv1beta1.Cluster{}).
+		For(p.opts.ObjectToWatch).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}). // no parallelism.
 		Complete(p); err != nil {
 		return fmt.Errorf("failed to create controller: %w", err)
@@ -164,7 +180,7 @@ func (p *Provider) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	log.Info("Reconciling Cluster")
 
 	// Get the CAPI cluster.
-	ccl := &capiv1beta1.Cluster{}
+	ccl := p.opts.ObjectToWatch.DeepCopyObject().(client.Object)
 	if err := p.client.Get(ctx, req.NamespacedName, ccl); err != nil {
 		if apierrors.IsNotFound(err) {
 			p.removeCluster(ctx, key)
@@ -174,7 +190,7 @@ func (p *Provider) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	}
 
 	// Handle deletion.
-	if ccl.DeletionTimestamp != nil {
+	if ccl.GetDeletionTimestamp() != nil {
 		p.removeCluster(ctx, key)
 		return reconcile.Result{}, nil
 	}
@@ -230,7 +246,7 @@ func (p *Provider) hashKubeconfig(kubeconfigData []byte) string {
 }
 
 // createAndEngageCluster creates a new cluster, starts it, and engages it with the manager.
-func (p *Provider) createAndEngageCluster(ctx context.Context, key multicluster.ClusterName, ccl *capiv1beta1.Cluster, cfg *rest.Config, hashStr string) error {
+func (p *Provider) createAndEngageCluster(ctx context.Context, key multicluster.ClusterName, ccl client.Object, cfg *rest.Config, hashStr string) error {
 	log := log.FromContext(ctx)
 	log.Info("Creating new cluster")
 
